@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<meta charset="UTF-8">
+	<title>Global Local Storage Core</title>
+</head>
+
+<body>
+	<script type="module">
+		import { openDB } from 'https://esm.run/idb'
+
+		const DB_NAME = 'GlobalLocalStorageDB'
+		const DB_VERSION = 1
+		const STORE_NAME = 'KeyValueStore'
+		const channel = new BroadcastChannel('global-local-storage-updates') // 用于跨页面/标签页通信
+
+		const dbPromise = openDB(DB_NAME, DB_VERSION, {
+			upgrade(db) {
+				if (!db.objectStoreNames.contains(STORE_NAME))
+					db.createObjectStore(STORE_NAME, { keyPath: 'key' })
+			},
+		})
+
+		/**
+		 * 检查指定源是否拥有访问权限。
+		 * @param {string[]} aclList - 权限列表。
+		 * @param {string} origin - 请求来源的 Origin。
+		 * @returns {boolean} - 是否有权限。
+		 */
+		function hasPermission(aclList, origin) {
+			if (!Array.isArray(aclList)) return false
+			return aclList.includes('*') || aclList.includes(origin)
+		}
+
+		// --- 数据库操作 (集成 TTL 和广播功能) ---
+
+		async function dbGet(key, origin) {
+			const db = await dbPromise
+			const item = await db.get(STORE_NAME, key)
+
+			if (!item) return null
+
+			// 检查数据是否已过期，若过期则执行惰性删除
+			if (item.expiresAt && Date.now() > item.expiresAt) {
+				await db.delete(STORE_NAME, key)
+				channel.postMessage({ key, action: 'remove' }) // 广播删除事件
+				return null
+			}
+
+			if (hasPermission(item.acl.read, origin))
+				return item.value
+
+			throw new Error(`Origin '${origin}' does not have read permission for key '${key}'.`)
+		}
+
+		async function dbSet(key, value, options, origin) {
+			const db = await dbPromise
+			const tx = db.transaction(STORE_NAME, 'readwrite')
+			const store = tx.objectStore(STORE_NAME)
+			const existingItem = await store.get(key)
+
+			const acl = options?.acl
+			const ttl = options?.ttl // 获取 TTL (Time-To-Live)
+
+			const newAcl = {
+				read: acl?.read ?? ['*'],
+				write: acl?.write ?? [origin],
+			}
+
+			if (existingItem) {
+				if (!hasPermission(existingItem.acl.write, origin))
+					throw new Error(`Origin '${origin}' does not have write permission for key '${key}'.`)
+			}
+			else if (!newAcl.write.includes(origin))
+				newAcl.write.push(origin)
+
+			const itemToStore = {
+				key,
+				value,
+				acl: newAcl,
+				// 如果提供了ttl，则计算并存储过期时间戳
+				expiresAt: ttl ? Date.now() + ttl * 1000 : null
+			}
+
+			await store.put(itemToStore)
+			await tx.done
+
+			// 广播数据变更事件
+			channel.postMessage({ key, action: 'set' })
+		}
+
+		async function dbRemove(key, origin) {
+			const db = await dbPromise
+			const tx = db.transaction(STORE_NAME, 'readwrite')
+			const store = tx.objectStore(STORE_NAME)
+			const existingItem = await store.get(key)
+
+			if (!existingItem) return
+
+			if (!hasPermission(existingItem.acl.write, origin))
+				throw new Error(`Origin '${origin}' does not have write permission for key '${key}'.`)
+
+			await store.delete(key)
+			await tx.done
+
+			channel.postMessage({ key, action: 'remove' })
+		}
+
+		async function dbClear(origin) {
+			const db = await dbPromise
+			const tx = db.transaction(STORE_NAME, 'readwrite')
+			const store = tx.objectStore(STORE_NAME)
+
+			for await (const cursor of store.iterate())
+				if (hasPermission(cursor.value.acl.write, origin)) {
+					const keyToDelete = cursor.value.key
+					cursor.delete()
+					channel.postMessage({ key: keyToDelete, action: 'remove' })
+				}
+
+			await tx.done
+		}
+
+		async function dbKeys(origin) {
+			const db = await dbPromise
+			const allItems = await db.getAll(STORE_NAME)
+			const readableKeys = []
+			for (const item of allItems)
+				if (hasPermission(item.acl.read, origin))
+					readableKeys.push(item.key)
+
+			return readableKeys
+		}
+
+		// --- 主消息监听器 ---
+		window.addEventListener('message', async (event) => {
+			if (!event.origin || !event.source) return
+
+			const { action, key, value, options, requestId } = event.data
+
+			try {
+				let responseValue
+				switch (action) {
+					case 'setItem':
+						await dbSet(key, value, options, event.origin)
+						break
+					case 'getItem':
+						responseValue = await dbGet(key, event.origin)
+						break
+					case 'removeItem':
+						await dbRemove(key, event.origin)
+						break
+					case 'clear':
+						await dbClear(event.origin)
+						break
+					case 'keys':
+						responseValue = await dbKeys(event.origin)
+						break
+					default:
+						return
+				}
+
+				event.source.postMessage({ action: 'response', requestId, value: responseValue }, event.origin)
+			}
+			catch (e) {
+				console.error('Error in GlobalLocalStorage core:', e)
+				event.source.postMessage({ action: 'response', requestId, error: { name: e.name, message: e.message } }, event.origin)
+			}
+		})
+	</script>
+</body>
+
+</html>
